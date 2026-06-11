@@ -1,0 +1,708 @@
+#include "stm32f429xx.h"
+
+/* ================================================================
+ *  WHACK-A-MOLE  —  STM32F429ZI  (Nucleo-144 / Discovery)
+ *  Original game logic UNTOUCHED.
+ *  Added: LTDC + ILI9341 LCD (SPI5) for score / time / splash.
+ *
+ *  LED mapping (unchanged):
+ *    0 = PB5  (top-left)     Button: PE0
+ *    1 = PB9  (top-right)    Button: PB8
+ *    2 = PB7  (bottom-left)  Button: PB4
+ *    3 = PE1  (bottom-right) Button: PB6
+ *
+ *  ILI9341 SPI wiring (STM32F429I-DISC1 on-board LCD):
+ *    SPI5  SCK  -> PF7   (AF5)
+ *    SPI5  MOSI -> PF9   (AF5)
+ *    CS         -> PC2   (GPIO out)
+ *    DC/RS      -> PD13  (GPIO out)
+ *    RST        -> PD12  (GPIO out) -- or tie to 3V3 and skip HW reset
+ *    (MISO not needed — write-only)
+ *
+ *  LCD resolution: 240 × 320 (ILI9341), landscape used as 320 × 240
+ * ================================================================ */
+
+/* ----------------------------------------------------------------
+ *  Forward declarations
+ * ---------------------------------------------------------------- */
+void timer2_delay_ms(int ms);
+uint32_t simple_rand(void);
+
+/* LCD subsystem */
+static void lcd_init(void);
+static void lcd_fill(uint16_t colour);
+static void lcd_draw_rect(int x, int y, int w, int h, uint16_t colour);
+static void lcd_draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale);
+static void lcd_draw_string(int x, int y, const char *s, uint16_t fg, uint16_t bg, int scale);
+static void lcd_draw_number(int x, int y, int n, uint16_t fg, uint16_t bg, int scale);
+static void lcd_splash(void);
+static void lcd_update_hud(void);
+static void lcd_hit_flash(void);
+static void lcd_miss_flash(void);
+
+/* ----------------------------------------------------------------
+ *  Game state  (original, untouched names / types)
+ * ---------------------------------------------------------------- */
+volatile int      active_led  = 0;
+volatile int      score       = 0;
+volatile uint32_t rand_seed   = 1;
+
+/* Extra state used by LCD HUD only */
+static volatile uint32_t game_ticks_ms = 0;   /* rough elapsed ms   */
+static volatile int      misses        = 0;    /* wrong-button count */
+
+/* ================================================================
+ *  COLOUR PALETTE  (RGB565)
+ * ================================================================ */
+#define C_BLACK    0x0000u
+#define C_WHITE    0xFFFFu
+#define C_BG       0x0841u   /* dark navy                          */
+#define C_PANEL    0x10A2u   /* slightly lighter panel             */
+#define C_GREEN    0x07E0u
+#define C_LIME     0x87E0u
+#define C_RED      0xF800u
+#define C_YELLOW   0xFFE0u
+#define C_ORANGE   0xFD20u
+#define C_CYAN     0x07FFu
+#define C_MAGENTA  0xF81Fu
+#define C_GRAY     0x4A69u
+#define C_DARKGRAY 0x2104u
+#define C_GOLD     0xFEA0u
+#define C_MOLE     0x8C00u   /* brown-ish mole colour              */
+#define C_GRASS    0x0400u   /* dark green grass                   */
+
+/* ================================================================
+ *  TINY 5×7 FONT  (ASCII 32-90)
+ *  Each entry = 5 column bytes; bit0 = topmost pixel of column
+ * ================================================================ */
+static const uint8_t font5x7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* 32  ' ' */
+    {0x00,0x00,0x5F,0x00,0x00}, /* 33  '!' */
+    {0x00,0x07,0x00,0x07,0x00}, /* 34  '"' */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* 35  '#' */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* 36  '$' */
+    {0x23,0x13,0x08,0x64,0x62}, /* 37  '%' */
+    {0x36,0x49,0x55,0x22,0x50}, /* 38  '&' */
+    {0x00,0x05,0x03,0x00,0x00}, /* 39  '\''*/
+    {0x00,0x1C,0x22,0x41,0x00}, /* 40  '(' */
+    {0x00,0x41,0x22,0x1C,0x00}, /* 41  ')' */
+    {0x14,0x08,0x3E,0x08,0x14}, /* 42  '*' */
+    {0x08,0x08,0x3E,0x08,0x08}, /* 43  '+' */
+    {0x00,0x50,0x30,0x00,0x00}, /* 44  ',' */
+    {0x08,0x08,0x08,0x08,0x08}, /* 45  '-' */
+    {0x00,0x60,0x60,0x00,0x00}, /* 46  '.' */
+    {0x20,0x10,0x08,0x04,0x02}, /* 47  '/' */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 48  '0' */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 49  '1' */
+    {0x72,0x49,0x49,0x49,0x46}, /* 50  '2' */
+    {0x21,0x41,0x49,0x4D,0x33}, /* 51  '3' */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 52  '4' */
+    {0x27,0x45,0x45,0x45,0x39}, /* 53  '5' */
+    {0x3C,0x4A,0x49,0x49,0x31}, /* 54  '6' */
+    {0x41,0x21,0x11,0x09,0x07}, /* 55  '7' */
+    {0x36,0x49,0x49,0x49,0x36}, /* 56  '8' */
+    {0x46,0x49,0x49,0x29,0x1E}, /* 57  '9' */
+    {0x00,0x36,0x36,0x00,0x00}, /* 58  ':' */
+    {0x00,0x56,0x36,0x00,0x00}, /* 59  ';' */
+    {0x08,0x14,0x22,0x41,0x00}, /* 60  '<' */
+    {0x14,0x14,0x14,0x14,0x14}, /* 61  '=' */
+    {0x00,0x41,0x22,0x14,0x08}, /* 62  '>' */
+    {0x02,0x01,0x51,0x09,0x06}, /* 63  '?' */
+    {0x32,0x49,0x79,0x41,0x3E}, /* 64  '@' */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* 65  'A' */
+    {0x7F,0x49,0x49,0x49,0x36}, /* 66  'B' */
+    {0x3E,0x41,0x41,0x41,0x22}, /* 67  'C' */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* 68  'D' */
+    {0x7F,0x49,0x49,0x49,0x41}, /* 69  'E' */
+    {0x7F,0x09,0x09,0x09,0x01}, /* 70  'F' */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* 71  'G' */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* 72  'H' */
+    {0x00,0x41,0x7F,0x41,0x00}, /* 73  'I' */
+    {0x20,0x40,0x41,0x3F,0x01}, /* 74  'J' */
+    {0x7F,0x08,0x14,0x22,0x41}, /* 75  'K' */
+    {0x7F,0x40,0x40,0x40,0x40}, /* 76  'L' */
+    {0x7F,0x02,0x0C,0x02,0x7F}, /* 77  'M' */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* 78  'N' */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* 79  'O' */
+    {0x7F,0x09,0x09,0x09,0x06}, /* 80  'P' */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* 81  'Q' */
+    {0x7F,0x09,0x19,0x29,0x46}, /* 82  'R' */
+    {0x46,0x49,0x49,0x49,0x31}, /* 83  'S' */
+    {0x01,0x01,0x7F,0x01,0x01}, /* 84  'T' */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* 85  'U' */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* 86  'V' */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* 87  'W' */
+    {0x63,0x14,0x08,0x14,0x63}, /* 88  'X' */
+    {0x07,0x08,0x70,0x08,0x07}, /* 89  'Y' */
+    {0x61,0x51,0x49,0x45,0x43}, /* 90  'Z' */
+};
+
+/* ----------------------------------------------------------------
+ *  Pin macros — keep here, after the spi helpers that use them
+ * ---------------------------------------------------------------- */
+#define LCD_CS_LOW()    (GPIOC->BSRR = (1u<<(2+16)))
+#define LCD_CS_HIGH()   (GPIOC->BSRR = (1u<<2))
+#define LCD_DC_CMD()    (GPIOD->BSRR = (1u<<(13+16)))
+#define LCD_DC_DATA()   (GPIOD->BSRR = (1u<<13))
+#define LCD_RST_LOW()   (GPIOD->BSRR = (1u<<(12+16)))
+#define LCD_RST_HIGH()  (GPIOD->BSRR = (1u<<12))
+
+/* ================================================================
+ *  SPI5 helpers  (bare-metal, polling)
+ * ================================================================ */
+static inline void spi5_write_byte(uint8_t b)
+{
+    while (!(SPI5->SR & SPI_SR_TXE));
+    *(__IO uint8_t *)&SPI5->DR = b;
+    while (SPI5->SR & SPI_SR_BSY);
+}
+
+static inline void lcd_cmd(uint8_t cmd)
+{
+    LCD_DC_CMD();
+    LCD_CS_LOW();
+    spi5_write_byte(cmd);
+    LCD_CS_HIGH();
+}
+
+static inline void lcd_dat(uint8_t dat)
+{
+    LCD_DC_DATA();
+    LCD_CS_LOW();
+    spi5_write_byte(dat);
+    LCD_CS_HIGH();
+}
+
+/* send 16-bit colour word */
+static inline void lcd_dat16(uint16_t d)
+{
+    LCD_DC_DATA();
+    LCD_CS_LOW();
+    spi5_write_byte(d >> 8);
+    spi5_write_byte(d & 0xFF);
+    LCD_CS_HIGH();
+}
+
+
+/* ================================================================
+ *  Set address window (ILI9341)
+ * ================================================================ */
+static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    lcd_cmd(0x2A);          /* Column addr set */
+    lcd_dat(x0 >> 8); lcd_dat(x0 & 0xFF);
+    lcd_dat(x1 >> 8); lcd_dat(x1 & 0xFF);
+
+    lcd_cmd(0x2B);          /* Row addr set    */
+    lcd_dat(y0 >> 8); lcd_dat(y0 & 0xFF);
+    lcd_dat(y1 >> 8); lcd_dat(y1 & 0xFF);
+
+    lcd_cmd(0x2C);          /* Memory write    */
+}
+
+/* ================================================================
+ *  LCD INIT  —  full ILI9341 initialisation sequence
+ * ================================================================ */
+static void lcd_init(void)
+{
+    /* ---- Clock enables ---- */
+    RCC->AHB1ENR |= (1<<2) | (1<<3);   /* GPIOC, GPIOD */
+    RCC->AHB1ENR |= (1<<5);            /* GPIOF        */
+    RCC->APB2ENR |= (1<<20);           /* SPI5         */
+
+    /* ---- PC2 = CS (output push-pull) ---- */
+    GPIOC->MODER  &= ~(3u<<(2*2));
+    GPIOC->MODER  |=  (1u<<(2*2));
+    GPIOC->OSPEEDR|=  (3u<<(2*2));
+
+    /* ---- PD12 = RST, PD13 = DC (output push-pull) ---- */
+    GPIOD->MODER  &= ~((3u<<(12*2))|(3u<<(13*2)));
+    GPIOD->MODER  |=   (1u<<(12*2)) |(1u<<(13*2));
+    GPIOD->OSPEEDR|=   (3u<<(12*2)) |(3u<<(13*2));
+
+    /* ---- PF7 = SCK, PF9 = MOSI (AF5) ---- */
+    GPIOF->MODER  &= ~((3u<<(7*2))|(3u<<(9*2)));
+    GPIOF->MODER  |=   (2u<<(7*2)) |(2u<<(9*2));
+    GPIOF->OSPEEDR|=   (3u<<(7*2)) |(3u<<(9*2));
+    GPIOF->AFR[0] &= ~(0xFu<<(7*4));   GPIOF->AFR[0] |= (5u<<(7*4));  /* PF7 AF5 */
+    GPIOF->AFR[1] &= ~(0xFu<<((9-8)*4)); GPIOF->AFR[1] |= (5u<<((9-8)*4)); /* PF9 AF5 */
+
+    /* ---- SPI5: master, CPOL=0, CPHA=0, 8-bit, fPCLK/2 (APB2~90MHz ? 45MHz) ---- */
+    SPI5->CR1 = 0;
+    SPI5->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI;
+    /* BR=0 => fPCLK/2; set BR=1 => /4 for safety at 180MHz APB2 */
+    SPI5->CR1 |= (1u << SPI_CR1_BR_Pos);
+    SPI5->CR2  = 0;
+    SPI5->CR1 |= SPI_CR1_SPE;
+
+    /* ---- Hardware reset ---- */
+    LCD_CS_HIGH();
+    LCD_RST_HIGH();
+    timer2_delay_ms(10);
+    LCD_RST_LOW();
+    timer2_delay_ms(20);
+    LCD_RST_HIGH();
+    timer2_delay_ms(150);
+
+    /* ---- ILI9341 init sequence ---- */
+    lcd_cmd(0x01);  timer2_delay_ms(100); /* Software reset */
+    lcd_cmd(0x11);  timer2_delay_ms(120); /* Sleep out      */
+
+    lcd_cmd(0xCF);
+    lcd_dat(0x00); lcd_dat(0xC1); lcd_dat(0x30);
+
+    lcd_cmd(0xED);
+    lcd_dat(0x64); lcd_dat(0x03); lcd_dat(0x12); lcd_dat(0x81);
+
+    lcd_cmd(0xE8);
+    lcd_dat(0x85); lcd_dat(0x00); lcd_dat(0x78);
+
+    lcd_cmd(0xCB);
+    lcd_dat(0x39); lcd_dat(0x2C); lcd_dat(0x00); lcd_dat(0x34); lcd_dat(0x02);
+
+    lcd_cmd(0xF7); lcd_dat(0x20);
+    lcd_cmd(0xEA); lcd_dat(0x00); lcd_dat(0x00);
+
+    lcd_cmd(0xC0); lcd_dat(0x23);           /* Power control 1     */
+    lcd_cmd(0xC1); lcd_dat(0x10);           /* Power control 2     */
+    lcd_cmd(0xC5); lcd_dat(0x3E); lcd_dat(0x28); /* VCOM control 1 */
+    lcd_cmd(0xC7); lcd_dat(0x86);           /* VCOM control 2      */
+
+    lcd_cmd(0x36); lcd_dat(0x48);           /* MADCTL: MX+BGR ? landscape 320×240 */
+    lcd_cmd(0x3A); lcd_dat(0x55);           /* Pixel format: 16 bpp */
+
+    lcd_cmd(0xB1); lcd_dat(0x00); lcd_dat(0x18); /* Frame rate 79 Hz */
+    lcd_cmd(0xB6); lcd_dat(0x08); lcd_dat(0x82); lcd_dat(0x27);
+    lcd_cmd(0xF2); lcd_dat(0x00);
+    lcd_cmd(0x26); lcd_dat(0x01);
+
+    /* Gamma */
+    lcd_cmd(0xE0);
+    lcd_dat(0x0F); lcd_dat(0x31); lcd_dat(0x2B); lcd_dat(0x0C);
+    lcd_dat(0x0E); lcd_dat(0x08); lcd_dat(0x4E); lcd_dat(0xF1);
+    lcd_dat(0x37); lcd_dat(0x07); lcd_dat(0x10); lcd_dat(0x03);
+    lcd_dat(0x0E); lcd_dat(0x09); lcd_dat(0x00);
+
+    lcd_cmd(0xE1);
+    lcd_dat(0x00); lcd_dat(0x0E); lcd_dat(0x14); lcd_dat(0x03);
+    lcd_dat(0x11); lcd_dat(0x07); lcd_dat(0x31); lcd_dat(0xC1);
+    lcd_dat(0x48); lcd_dat(0x08); lcd_dat(0x0F); lcd_dat(0x0C);
+    lcd_dat(0x31); lcd_dat(0x36); lcd_dat(0x0F);
+
+    lcd_cmd(0x29);  /* Display ON */
+    timer2_delay_ms(50);
+}
+
+/* ================================================================
+ *  Drawing primitives
+ * ================================================================ */
+static void lcd_fill(uint16_t colour)
+{
+    lcd_set_window(0, 0, 319, 239);
+    LCD_DC_DATA();
+    LCD_CS_LOW();
+    uint8_t hi = colour >> 8, lo = colour & 0xFF;
+    for (int i = 0; i < 320*240; i++) {
+        spi5_write_byte(hi);
+        spi5_write_byte(lo);
+    }
+    LCD_CS_HIGH();
+}
+
+static void lcd_draw_rect(int x, int y, int w, int h, uint16_t colour)
+{
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > 320) w = 320 - x;
+    if (y + h > 240) h = 240 - y;
+    lcd_set_window((uint16_t)x, (uint16_t)y,
+                   (uint16_t)(x+w-1), (uint16_t)(y+h-1));
+    LCD_DC_DATA();
+    LCD_CS_LOW();
+    uint8_t hi = colour >> 8, lo = colour & 0xFF;
+    for (int i = 0; i < w*h; i++) {
+        spi5_write_byte(hi);
+        spi5_write_byte(lo);
+    }
+    LCD_CS_HIGH();
+}
+
+/* Draw a filled circle (simple Bresenham) */
+static void lcd_draw_circle_filled(int cx, int cy, int r, uint16_t colour)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = 0;
+        while (dx*dx + dy*dy <= r*r) dx++;
+        int x0 = cx - dx + 1;
+        int width = 2*(dx-1);
+        if (x0 < 0) x0 = 0;
+        if (x0 + width > 320) width = 320 - x0;
+        int y0 = cy + dy;
+        if (y0 >= 0 && y0 < 240 && width > 0)
+            lcd_draw_rect(x0, y0, width, 1, colour);
+    }
+}
+
+/* Draw single character from 5×7 font, scaled */
+static void lcd_draw_char(int x, int y, char c, uint16_t fg, uint16_t bg, int scale)
+{
+    if (c < 32 || c > 90) c = 32;
+    const uint8_t *glyph = font5x7[(uint8_t)c - 32];
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = glyph[col];
+        for (int row = 0; row < 7; row++) {
+            uint16_t colour = (bits & (1<<row)) ? fg : bg;
+            lcd_draw_rect(x + col*scale, y + row*scale, scale, scale, colour);
+        }
+    }
+}
+
+static void lcd_draw_string(int x, int y, const char *s,
+                             uint16_t fg, uint16_t bg, int scale)
+{
+    while (*s) {
+        char c = *s++;
+        if (c >= 'a' && c <= 'z') c -= 32; /* uppercase only */
+        lcd_draw_char(x, y, c, fg, bg, scale);
+        x += (5 + 1) * scale;
+    }
+}
+
+static void lcd_draw_number(int x, int y, int n,
+                             uint16_t fg, uint16_t bg, int scale)
+{
+    char buf[12];
+    int i = 0;
+    if (n < 0) { buf[i++] = '-'; n = -n; }
+    if (n == 0) { buf[i++] = '0'; }
+    else {
+        char tmp[10]; int ti = 0;
+        while (n) { tmp[ti++] = '0' + (n % 10); n /= 10; }
+        for (int j = ti-1; j >= 0; j--) buf[i++] = tmp[j];
+    }
+    buf[i] = '\0';
+    lcd_draw_string(x, y, buf, fg, bg, scale);
+}
+
+/* ================================================================
+ *  Draw a "mole hole" at grid position (col 0-1, row 0-1)
+ *  LEDs:  0=top-left  1=top-right  2=bot-left  3=bot-right
+ *  Grid centres on the 320×240 screen with a grass strip at bottom
+ * ================================================================ */
+/*  Layout (landscape 320×240):
+ *   y=0..29   : top HUD bar  (score / time / misses)
+ *   y=30..209 : play field  (2×2 mole holes)
+ *   y=210..239: bottom grass strip
+ */
+#define HOLE_CX(c)  (80  + (c)*160)   /* 80, 240                  */
+#define HOLE_CY(r)  (30 + 45 + (r)*95) /* 75,  170                 */
+#define HOLE_R      38
+
+static void lcd_draw_hole(int led, int mole_up)
+{
+    int cx = HOLE_CX(led & 1);      /* bit0 = column */
+    int cy = HOLE_CY((led >> 1));   /* bit1 = row    */
+
+    /* Hole shadow (dark ellipse — approximate with rect) */
+    lcd_draw_rect(cx - HOLE_R, cy + HOLE_R - 6, HOLE_R*2, 12, C_DARKGRAY);
+
+    /* Hole opening */
+    lcd_draw_circle_filled(cx, cy + HOLE_R - 4, HOLE_R - 4, C_BLACK);
+
+    if (mole_up) {
+        /* Mole body */
+        lcd_draw_circle_filled(cx, cy, HOLE_R - 6, C_MOLE);
+        /* Mole eyes */
+        lcd_draw_circle_filled(cx - 8, cy - 8, 4, C_WHITE);
+        lcd_draw_circle_filled(cx + 8, cy - 8, 4, C_WHITE);
+        lcd_draw_circle_filled(cx - 7, cy - 8, 2, C_BLACK);
+        lcd_draw_circle_filled(cx + 9, cy - 8, 2, C_BLACK);
+        /* Mole snout */
+        lcd_draw_circle_filled(cx, cy - 1, 5, C_RED);
+        /* Ears */
+        lcd_draw_circle_filled(cx - 14, cy - 18, 6, C_MOLE);
+        lcd_draw_circle_filled(cx + 14, cy - 18, 6, C_MOLE);
+    }
+}
+
+/* Redraw all 4 holes; active one has mole up */
+static void lcd_draw_playfield(void)
+{
+    /* Grass background for play area */
+    lcd_draw_rect(0, 30, 320, 180, C_GRASS);
+
+    /* Dividing cross lines (subtle) */
+    lcd_draw_rect(0,  119, 320, 2, C_DARKGRAY);
+    lcd_draw_rect(159, 30, 2,  180, C_DARKGRAY);
+
+    for (int i = 0; i < 4; i++)
+        lcd_draw_hole(i, (i == active_led) ? 1 : 0);
+
+    /* Bottom grass strip */
+    lcd_draw_rect(0, 210, 320, 30, C_GRASS);
+    /* Grass texture lines */
+    for (int x = 5; x < 320; x += 18)
+        lcd_draw_rect(x, 212, 3, 8 + ((x*7)%9), C_LIME);
+}
+
+/* ================================================================
+ *  HUD bar  (top 30 pixels)
+ * ================================================================ */
+static void lcd_update_hud(void)
+{
+    /* Background */
+    lcd_draw_rect(0, 0, 320, 30, C_PANEL);
+
+    /* Left divider accent */
+    lcd_draw_rect(0, 0, 4, 30, C_CYAN);
+
+    /* SCORE label + value */
+    lcd_draw_string(10, 5, "SCORE:", C_CYAN, C_PANEL, 2);
+    /* Clear old number area */
+    lcd_draw_rect(82, 5, 50, 14, C_PANEL);
+    lcd_draw_number(82, 5, score, C_GOLD, C_PANEL, 2);
+
+    /* TIME label + value */
+    uint32_t secs = game_ticks_ms / 1000;
+    uint32_t mins = secs / 60;
+    secs %= 60;
+
+    lcd_draw_string(160, 5, "TIME:", C_CYAN, C_PANEL, 2);
+    lcd_draw_rect(222, 5, 40, 14, C_PANEL);
+    lcd_draw_number(222, 5, (int)mins, C_WHITE, C_PANEL, 2);
+    lcd_draw_char(234, 5, ':', C_WHITE, C_PANEL, 2);
+    /* tens of seconds */
+    lcd_draw_char(240, 5, '0' + (secs/10), C_WHITE, C_PANEL, 2);
+    lcd_draw_char(252, 5, '0' + (secs%10), C_WHITE, C_PANEL, 2);
+
+    /* Misses indicator — right side */
+    lcd_draw_rect(290, 0, 30, 30, C_PANEL);
+    for (int i = 0; i < 3; i++) {
+        uint16_t col = (i < misses % 4) ? C_RED : C_DARKGRAY;
+        lcd_draw_circle_filled(297 + i*8, 15, 3, col);
+    }
+
+    /* Thin accent line under HUD */
+    lcd_draw_rect(0, 29, 320, 1, C_CYAN);
+}
+
+/* ================================================================
+ *  SPLASH SCREEN  — shown once at startup
+ * ================================================================ */
+static void lcd_splash(void)
+{
+    lcd_fill(C_BG);
+
+    /* Title box */
+    lcd_draw_rect(30, 40, 260, 60, C_PANEL);
+    lcd_draw_rect(30, 40, 260,  3, C_CYAN);   /* top accent  */
+    lcd_draw_rect(30, 97, 260,  3, C_CYAN);   /* bot accent  */
+
+    lcd_draw_string(50,  52, "WHACK-A-MOLE", C_GOLD,  C_PANEL, 3);
+    lcd_draw_string(95,  74, "STM32F429",    C_CYAN,  C_PANEL, 2);
+
+    /* Decorative mole face */
+    lcd_draw_circle_filled(160, 145, 36, C_MOLE);
+    lcd_draw_circle_filled(148, 133, 5, C_WHITE);
+    lcd_draw_circle_filled(172, 133, 5, C_WHITE);
+    lcd_draw_circle_filled(149, 133, 2, C_BLACK);
+    lcd_draw_circle_filled(173, 133, 2, C_BLACK);
+    lcd_draw_circle_filled(160, 141, 6, C_RED);
+    lcd_draw_circle_filled(146, 125, 8, C_MOLE);
+    lcd_draw_circle_filled(174, 125, 8, C_MOLE);
+
+    lcd_draw_string(60, 190, "PRESS ANY BUTTON", C_WHITE, C_BG, 2);
+    lcd_draw_string(90, 210, "TO START GAME",   C_GRAY,  C_BG, 2);
+
+    timer2_delay_ms(2000);   /* auto-advance after 2s or player presses */
+}
+
+/* ================================================================
+ *  Hit / Miss feedback flashes
+ * ================================================================ */
+static void lcd_hit_flash(void)
+{
+    /* Flash green border around hole */
+    int cx = HOLE_CX(active_led & 1);
+    int cy = HOLE_CY(active_led >> 1);
+    for (int i = 0; i < 2; i++) {
+        lcd_draw_rect(cx - HOLE_R - 4, cy - HOLE_R - 4,
+                      (HOLE_R+4)*2, 4, C_GREEN);
+        lcd_draw_rect(cx - HOLE_R - 4, cy + HOLE_R,
+                      (HOLE_R+4)*2, 4, C_GREEN);
+        lcd_draw_rect(cx - HOLE_R - 4, cy - HOLE_R - 4,
+                      4, (HOLE_R+4)*2, C_GREEN);
+        lcd_draw_rect(cx + HOLE_R,     cy - HOLE_R - 4,
+                      4, (HOLE_R+4)*2, C_GREEN);
+        timer2_delay_ms(40);
+        lcd_draw_rect(cx - HOLE_R - 4, cy - HOLE_R - 4,
+                      (HOLE_R+4)*2+4, 4, C_GRASS);
+        lcd_draw_rect(cx - HOLE_R - 4, cy + HOLE_R,
+                      (HOLE_R+4)*2+4, 4, C_GRASS);
+        lcd_draw_rect(cx - HOLE_R - 4, cy - HOLE_R - 4,
+                      4, (HOLE_R+4)*2, C_GRASS);
+        lcd_draw_rect(cx + HOLE_R,     cy - HOLE_R - 4,
+                      4, (HOLE_R+4)*2, C_GRASS);
+        timer2_delay_ms(40);
+    }
+    /* "+1" popup */
+    lcd_draw_rect(cx - 12, cy - 30, 36, 18, C_GREEN);
+    lcd_draw_string(cx - 10, cy - 28, "+1", C_WHITE, C_GREEN, 2);
+    timer2_delay_ms(250);
+    /* erase popup */
+    lcd_draw_rect(cx - 12, cy - 30, 36, 18, C_GRASS);
+}
+
+static void lcd_miss_flash(void)
+{
+    misses++;
+    /* Red flash top-left corner */
+    lcd_draw_rect(0, 0, 4, 30, C_RED);
+    timer2_delay_ms(120);
+    lcd_draw_rect(0, 0, 4, 30, C_CYAN);
+}
+
+/* ================================================================
+ *  RANDOM  (original, untouched)
+ * ================================================================ */
+uint32_t simple_rand(void)
+{
+    rand_seed ^= (rand_seed << 13);
+    rand_seed ^= (rand_seed >> 17);
+    rand_seed ^= (rand_seed << 5);
+    return rand_seed;
+}
+
+/* ================================================================
+ *  LIGHT A RANDOM LED  (original logic untouched; LCD added)
+ * ================================================================ */
+void light_random_led(void)
+{
+    rand_seed ^= TIM2->CNT;
+    active_led = simple_rand() % 4;
+
+    GPIOB->ODR &= ~((1<<5)|(1<<7)|(1<<9));
+    GPIOE->ODR &= ~(1<<1);
+
+    if (active_led == 0) GPIOB->ODR |= (1<<5);
+    if (active_led == 1) GPIOB->ODR |= (1<<9);
+    if (active_led == 2) GPIOB->ODR |= (1<<7);
+    if (active_led == 3) GPIOE->ODR |= (1<<1);
+
+    /* LCD: redraw play field showing new mole position */
+    lcd_draw_playfield();
+    lcd_update_hud();
+}
+
+/* ================================================================
+ *  CHECK HIT  (original logic untouched; LCD feedback added)
+ * ================================================================ */
+void check_hit(int pressed_led)
+{
+    if (pressed_led == active_led) {
+        score++;
+        GPIOB->ODR &= ~((1<<5)|(1<<7)|(1<<9));
+        GPIOE->ODR &= ~(1<<1);
+        lcd_hit_flash();          /* <-- LCD: green flash + score bump */
+        timer2_delay_ms(100);
+    } else {
+        lcd_miss_flash();         /* <-- LCD: red miss indicator       */
+    }
+    light_random_led();
+}
+
+/* ================================================================
+ *  MAIN
+ * ================================================================ */
+int main(void)
+{
+    __disable_irq();
+
+    /* ---- CLOCKS ---- */
+    RCC->AHB1ENR |= (1<<1);    /* GPIOB */
+    RCC->AHB1ENR |= (1<<4);    /* GPIOE */
+    RCC->APB2ENR |= (1<<14);   /* SYSCFG */
+    RCC->APB1ENR |= (1<<0);    /* TIM2 */
+
+    /* ---- LED OUTPUT (unchanged) ---- */
+    GPIOB->MODER &= ~(3<<(5*2)); GPIOB->MODER |= (1<<(5*2));
+    GPIOB->MODER &= ~(3<<(7*2)); GPIOB->MODER |= (1<<(7*2));
+    GPIOB->MODER &= ~(3<<(9*2)); GPIOB->MODER |= (1<<(9*2));
+    GPIOE->MODER &= ~(3<<(1*2)); GPIOE->MODER |= (1<<(1*2));
+
+    /* ---- BUTTON INPUT + PULLUP (unchanged) ---- */
+    GPIOB->MODER &= ~((3<<(4*2))|(3<<(6*2))|(3<<(8*2)));
+    GPIOB->PUPDR &= ~((3<<(4*2))|(3<<(6*2))|(3<<(8*2)));
+    GPIOB->PUPDR |=  ((1<<(4*2))|(1<<(6*2))|(1<<(8*2)));
+    GPIOE->MODER &= ~(3<<(0*2));
+    GPIOE->PUPDR &= ~(3<<(0*2));
+    GPIOE->PUPDR |=  (1<<(0*2));
+
+    /* ---- EXTI MAPPING (unchanged) ---- */
+    SYSCFG->EXTICR[0] &= ~0x000F; SYSCFG->EXTICR[0] |= 0x0004; /* PE0?EXTI0 */
+    SYSCFG->EXTICR[1] &= ~0x000F; SYSCFG->EXTICR[1] |= 0x0001; /* PB4?EXTI4 */
+    SYSCFG->EXTICR[1] &= ~0x0F00; SYSCFG->EXTICR[1] |= 0x0100; /* PB6?EXTI6 */
+    SYSCFG->EXTICR[2] &= ~0x000F; SYSCFG->EXTICR[2] |= 0x0001; /* PB8?EXTI8 */
+
+    /* ---- EXTI CONFIG falling edge (unchanged) ---- */
+    EXTI->IMR  |=  (1<<0)|(1<<4)|(1<<6)|(1<<8);
+    EXTI->FTSR |=  (1<<0)|(1<<4)|(1<<6)|(1<<8);
+    EXTI->RTSR &= ~((1<<0)|(1<<4)|(1<<6)|(1<<8));
+    EXTI->PR    =  (1<<0)|(1<<4)|(1<<6)|(1<<8);
+
+    /* ---- NVIC (unchanged) ---- */
+    NVIC_EnableIRQ(EXTI0_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    /* ---- LCD init + splash ---- */
+    lcd_init();
+    lcd_splash();
+
+    __enable_irq();
+
+    /* First mole */
+    light_random_led();
+
+    /* ================================================================
+     *  Main loop — same 1.5 s auto-advance as original
+     *  + elapsed-time tracking for HUD
+     * ================================================================ */
+    while (1) {
+        timer2_delay_ms(1500);
+        game_ticks_ms += 1500;   /* update elapsed time counter     */
+        lcd_update_hud();        /* refresh HUD time every cycle     */
+        light_random_led();      /* mole moves on its own            */
+    }
+}
+
+/* ================================================================
+ *  IRQ HANDLERS  (original, untouched)
+ * ================================================================ */
+void EXTI0_IRQHandler(void) {
+    if (EXTI->PR & (1<<0)) { EXTI->PR = (1<<0); check_hit(0); }
+}
+void EXTI4_IRQHandler(void) {
+    if (EXTI->PR & (1<<4)) { EXTI->PR = (1<<4); check_hit(2); }
+}
+void EXTI9_5_IRQHandler(void) {
+    if (EXTI->PR & (1<<6)) { EXTI->PR = (1<<6); check_hit(3); }
+    if (EXTI->PR & (1<<8)) { EXTI->PR = (1<<8); check_hit(1); }
+}
+
+/* ================================================================
+ *  DELAY  (original, untouched)
+ * ================================================================ */
+void timer2_delay_ms(int ms)
+{
+    TIM2->PSC  = 16000 - 1;
+    TIM2->ARR  = ms - 1;
+    TIM2->CNT  = 0;
+    TIM2->SR  &= ~0x01;
+    TIM2->EGR  = 0x01;
+    TIM2->SR  &= ~0x01;
+    TIM2->CR1 |=  0x01;
+    while (!(TIM2->SR & 0x01));
+    TIM2->SR  &= ~0x01;
+    TIM2->CR1 &= ~0x01;
+}
